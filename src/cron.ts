@@ -86,18 +86,30 @@ function matchesDay(schedule: CronSchedule, dayOfMonth: number, dayOfWeek: numbe
 export function nextCronTime(expr: string, after: Date): Date {
   const schedule = parseCron(expr);
   if (!Number.isFinite(after.getTime())) throw new Error("Invalid date");
-  const firstMinute = Math.floor(after.getTime() / 60_000) * 60_000 + 60_000;
-  const minutesToSearch = 366 * 24 * 60;
+  const afterMinute = Math.floor(after.getTime() / 60_000) * 60_000;
+  const firstDay = new Date(after.getFullYear(), after.getMonth(), after.getDate());
+  const hours = [...schedule.hour.values].sort((a, b) => a - b);
+  const minutes = [...schedule.minute.values].sort((a, b) => a - b);
 
-  for (let minuteOffset = 0; minuteOffset < minutesToSearch; minuteOffset++) {
-    const candidate = new Date(firstMinute + minuteOffset * 60_000);
-    if (!schedule.month.values.has(candidate.getMonth() + 1)
-      || !schedule.hour.values.has(candidate.getHours())
-      || !schedule.minute.values.has(candidate.getMinutes())) {
+  for (let dayOffset = 0; dayOffset < 8 * 366; dayOffset++) {
+    const day = new Date(firstDay);
+    day.setDate(firstDay.getDate() + dayOffset);
+    const year = day.getFullYear();
+    const month = day.getMonth();
+    const dayOfMonth = day.getDate();
+    if (!schedule.month.values.has(month + 1)
+      || !matchesDay(schedule, dayOfMonth, day.getDay())) {
       continue;
     }
-    if (matchesDay(schedule, candidate.getDate(), candidate.getDay())) return candidate;
+
+    for (const hour of hours) {
+      for (const minute of minutes) {
+        const candidate = new Date(year, month, dayOfMonth, hour, minute);
+        if (candidate.getHours() !== hour || candidate.getMinutes() !== minute) continue;
+        if (candidate.getTime() > afterMinute) return candidate;
+      }
+    }
   }
 
-  throw new Error("No matching cron time within 366 days");
+  throw new Error("No matching cron time within 8 years");
 }

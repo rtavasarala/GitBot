@@ -112,7 +112,7 @@ test("gates job APIs and accepts only signed webhook triggers", async () => {
       name: "HTTP webhook job",
       botId: jobBot.id,
       prompt: "Handle this GitHub event",
-      trigger: { type: "webhook" },
+      trigger: { type: "webhook", events: ["issues"] },
     }),
   });
   assert.equal(createdWebhook.status, 200);
@@ -134,6 +134,38 @@ test("gates job APIs and accepts only signed webhook triggers", async () => {
   assert.equal(webhookEnqueues.at(-1).trigger, "webhook");
   assert.equal(webhookEnqueues.at(-1).webhook.event, "issues");
   assert.equal(webhookEnqueues.at(-1).webhook.rawBody.toString(), payload);
+
+  const enqueueCount = webhookEnqueues.length;
+  const ignoredEvent = await fetch(`${baseUrl}/hooks/jobs/${webhookJob.id}`, {
+    method: "POST",
+    headers: {
+      "X-Hub-Signature-256": signature,
+      "X-GitHub-Event": "push",
+    },
+    body: payload,
+  });
+  assert.equal(ignoredEvent.status, 202);
+  assert.deepEqual(await ignoredEvent.json(), { status: "ignored" });
+  assert.equal(webhookEnqueues.length, enqueueCount);
+
+  const missingEvent = await fetch(`${baseUrl}/hooks/jobs/${webhookJob.id}`, {
+    method: "POST",
+    headers: { "X-Hub-Signature-256": signature },
+    body: payload,
+  });
+  assert.equal(missingEvent.status, 202);
+  assert.deepEqual(await missingEvent.json(), { status: "ignored" });
+  assert.equal(webhookEnqueues.length, enqueueCount);
+
+  const invalidJson = "{ invalid";
+  const invalidJsonSignature = `sha256=${createHmac("sha256", webhookJob.webhookSecret).update(invalidJson).digest("hex")}`;
+  const malformed = await fetch(`${baseUrl}/hooks/jobs/${webhookJob.id}`, {
+    method: "POST",
+    headers: { "X-Hub-Signature-256": invalidJsonSignature, "X-GitHub-Event": "issues" },
+    body: invalidJson,
+  });
+  assert.equal(malformed.status, 400);
+  assert.equal(webhookEnqueues.length, enqueueCount);
 
   const rejected = await fetch(`${baseUrl}/hooks/jobs/${webhookJob.id}`, {
     method: "POST",

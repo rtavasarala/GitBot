@@ -183,8 +183,21 @@ export async function handleJobWebhook(
     jsonError(res, 404, "Job not found");
     return true;
   }
-  if (!validSignature(job.webhookSecret, raw.body ?? Buffer.alloc(0), header(req, "x-hub-signature-256"))) {
+  const body = raw.body ?? Buffer.alloc(0);
+  if (!validSignature(job.webhookSecret, body, header(req, "x-hub-signature-256"))) {
     jsonError(res, 401, "Invalid webhook signature");
+    return true;
+  }
+  try {
+    JSON.parse(body.toString("utf8"));
+  } catch {
+    jsonError(res, 400, "Webhook body must be valid JSON");
+    return true;
+  }
+  const event = header(req, "x-github-event");
+  if (job.trigger.events && (!event || !job.trigger.events.includes(event))) {
+    res.writeHead(202, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ignored" }));
     return true;
   }
   if (!runner) {
@@ -193,8 +206,8 @@ export async function handleJobWebhook(
   }
 
   const status = runner.enqueue(job, "webhook", {
-    event: header(req, "x-github-event") ?? "unknown",
-    rawBody: raw.body,
+    event: event ?? "unknown",
+    rawBody: body,
   });
   res.writeHead(202, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ status: status === "duplicate" ? "queued" : status }));

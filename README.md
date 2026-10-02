@@ -50,7 +50,7 @@ cd /path/to/your/projects
 gitbot start
 ```
 
-Open **http://localhost:3000** on your computer. GitBot prints a network address and QR code if you want to connect from another device on the same trusted network. The workspace works best on desktop.
+Open the localhost URL at the port printed by `gitbot start` (default range **32100–32199**). GitBot prints a network address and QR code if you want to connect from another device on the same trusted network. The workspace works best on desktop.
 
 > **Before connecting another device:** GitBot prints a sign-in link for this machine. Keep it on a trusted network and never expose the port to the public internet. [Read the security notes](#security-and-privacy).
 
@@ -155,7 +155,7 @@ Create scheduled, manual, or webhook-triggered runs through the authenticated AP
 Create a weekday cron job:
 
 ```bash
-# Use the port printed by `gitbot start` (auto-selected from 32100–32199).
+# Replace with the port printed by `gitbot start` (default range: 32100–32199).
 PORT=32100
 API="http://localhost:$PORT"
 TOKEN="$(gitbot token)"
@@ -211,7 +211,7 @@ GitBot has no account, telemetry, or hosted database. Bots and thread records li
 ## Useful commands
 
 ```bash
-gitbot start                 # use port 3000
+gitbot start                 # auto-select a port from 32100–32199
 gitbot start -p 4000         # choose another port
 gitbot start --caffeinate    # keep a Mac awake during long jobs
 ```
@@ -225,7 +225,7 @@ The folder where you run `gitbot start` becomes the workspace shown first in the
 | If you see... | Try this |
 | --- | --- |
 | An agent is missing from the menu | Install and sign in to its CLI, then restart GitBot. |
-| Port 3000 is already in use | Run `gitbot start -p 4000`. |
+| No port is available in the default range | Run `gitbot start -p 4000`. |
 | An imported bot needs an agent you don't have | Install that agent or change the bot's agent. |
 | The web UI has not been built | If running from source, run `npm run build`. |
 

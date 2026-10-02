@@ -23,6 +23,13 @@ test("finds the first day of the next month", () => {
   );
 });
 
+test("finds leap day across multiple years", () => {
+  assert.equal(
+    nextCronTime("0 9 29 2 *", new Date(2025, 2, 1)).getTime(),
+    new Date(2028, 1, 29, 9, 0).getTime(),
+  );
+});
+
 test("uses OR semantics when both day fields are restricted", () => {
   assert.equal(
     nextCronTime("0 0 13 * 5", new Date(2025, 0, 1, 0, 0)).getTime(),
@@ -46,4 +53,5 @@ test("rejects malformed and out-of-range cron expressions", () => {
   for (const expr of ["60 * * * *", "* * *", "a * * * *", "*/0 * * * *"]) {
     assert.throws(() => parseCron(expr));
   }
+  assert.throws(() => nextCronTime("0 0 30 2 *", new Date(2025, 0, 1)));
 });

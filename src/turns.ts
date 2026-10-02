@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { existsSync } from "fs";
 import {
   createSession,
   emitEvent,
@@ -50,6 +51,11 @@ export function startTurn(input: TurnInput, availableAgents: string[]): TurnResu
   if (threadId) {
     const thread = getThread(threadId);
     if (!thread) return failure(404, "Thread not found");
+    if (!existsSync(thread.repoPath)) {
+      return failure(409, `This thread's folder no longer exists (${thread.repoPath}); start a new thread`, {
+        repoMissing: true,
+      });
+    }
     const bot = getBot(thread.botId);
     if (!bot) return failure(404, "Bot not found");
     repoPath = thread.repoPath;

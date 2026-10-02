@@ -7,7 +7,7 @@ export type JobTrigger =
   | { type: "manual" }
   | { type: "interval"; everyMinutes: number }
   | { type: "cron"; expr: string }
-  | { type: "webhook" };
+  | { type: "webhook"; events?: string[] };
 
 export interface JobPolicy {
   approvals: "escalate" | "auto" | "deny";
@@ -126,13 +126,23 @@ export function validateJobInput(input: unknown, existing?: Job): JobValidationR
       if (typeof (triggerValue as any).expr !== "string") return { ok: false, message: "cron expr is required" };
       try {
         parseCron((triggerValue as any).expr);
+        nextCronTime((triggerValue as any).expr, new Date());
       } catch (error) {
         return { ok: false, message: `Invalid cron expression: ${error instanceof Error ? error.message : String(error)}` };
       }
       trigger = { type: "cron", expr: (triggerValue as any).expr };
       break;
     case "webhook":
-      trigger = { type: "webhook" };
+      if ((triggerValue as any).events !== undefined) {
+        const events = (triggerValue as any).events;
+        if (!Array.isArray(events) || events.length === 0
+          || events.some((event: unknown) => typeof event !== "string" || !event.trim())) {
+          return { ok: false, message: "webhook events must be a non-empty array of non-empty strings" };
+        }
+        trigger = { type: "webhook", events: events.map((event: string) => event.trim()) };
+      } else {
+        trigger = { type: "webhook" };
+      }
       break;
     default:
       return { ok: false, message: "trigger type must be manual, interval, cron, or webhook" };
@@ -183,6 +193,10 @@ export function validateJobInput(input: unknown, existing?: Job): JobValidationR
     nextRunAt = new Date(currentTime.getTime() + trigger.everyMinutes * 60_000).toISOString();
   } else if (enabled && trigger.type === "cron") {
     nextRunAt = nextCronTime(trigger.expr, currentTime).toISOString();
+  }
+  if (existing?.enabled && enabled && existing.nextRunAt !== null
+    && JSON.stringify(trigger) === JSON.stringify(existing.trigger)) {
+    nextRunAt = existing.nextRunAt;
   }
 
   const policy: JobPolicy = {
