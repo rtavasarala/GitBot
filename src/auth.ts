@@ -12,7 +12,14 @@ export function loadOrCreateToken(): string {
   const tokenPath = join(directory, "token");
   if (existsSync(tokenPath)) {
     const storedToken = readFileSync(tokenPath, "utf-8").trim();
-    if (storedToken) return storedToken;
+    if (storedToken) {
+      try {
+        chmodSync(tokenPath, 0o600);
+      } catch {
+        // Ignore permission repair errors when the token remains readable.
+      }
+      return storedToken;
+    }
   }
 
   mkdirSync(directory, { recursive: true });

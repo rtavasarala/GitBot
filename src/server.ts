@@ -34,7 +34,14 @@ import { getBot, getThread, touchThread, updateThread, botNeedsSetup, DEFAULT_BO
 import { botPermissionToSession } from "./server-common";
 import { uiFileFor } from "./static-ui";
 import { isAuthorized, loadOrCreateToken, handleTokenBootstrap } from "./auth";
-import { listRuns, readRun, recoverInterruptedRuns, startRun } from "./run-log";
+import {
+  claimRunOwnership,
+  listRuns,
+  readRun,
+  recoverInterruptedRuns,
+  releaseRunOwnership,
+  startRun,
+} from "./run-log";
 
 export async function handleRequest(
   req: IRequest,
@@ -365,6 +372,7 @@ export async function handleRequest(
         if (s.status === "running") {
           emitEvent(s, "error", { message: err?.message ?? `${agent} failed to start` });
           s.status = "error";
+          scheduleCleanup(s);
           notifyPermissionsChanged();
         }
       };
@@ -490,8 +498,6 @@ export async function handleRequest(
 
 export async function start(network: string = "local", portOverride?: number, caffeinate: boolean = false) {
   const token = loadOrCreateToken();
-  const recoveredRuns = recoverInterruptedRuns();
-  if (recoveredRuns > 0) console.log(`  recovered ${recoveredRuns} interrupted run${recoveredRuns === 1 ? "" : "s"}`);
   const workspaceCwd = process.cwd();
   console.log(`gitbot — starting workspace server in ${workspaceCwd}`);
 
@@ -513,13 +519,18 @@ export async function start(network: string = "local", portOverride?: number, ca
   ];
   console.log(`  available agents: ${availableAgents.join(", ") || "none"}`);
 
-  const { server, caffeinatePid } = await createHttpServer({
+  const { server, caffeinatePid, PORT } = await createHttpServer({
     portOverride,
     caffeinate,
     network,
     label: "gitbot server",
     token,
   });
+
+  if (claimRunOwnership(PORT)) {
+    const recoveredRuns = recoverInterruptedRuns();
+    if (recoveredRuns > 0) console.log(`  recovered ${recoveredRuns} interrupted run${recoveredRuns === 1 ? "" : "s"}`);
+  }
 
   server.on("request", (req: http.IncomingMessage, res: http.ServerResponse) => {
     if (res.headersSent || res.writableEnded) return;
@@ -530,8 +541,10 @@ export async function start(network: string = "local", portOverride?: number, ca
   });
 
   process.on("exit", stopOpencode);
+  process.on("exit", releaseRunOwnership);
   setupShutdown(() => {
     stopOpencode();
+    releaseRunOwnership();
     server.close(() => process.exit(0));
   }, caffeinatePid);
 }

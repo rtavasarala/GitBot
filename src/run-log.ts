@@ -1,5 +1,14 @@
 import { randomUUID } from "crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import {
+  chmodSync,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 import type { WriteStream } from "fs";
 import { join } from "path";
 import { dataDir } from "./bot-store";
@@ -21,9 +30,11 @@ export interface RunSummary {
 
 const RUNS_DIR = join(dataDir(), "runs");
 const INDEX_FILE = join(RUNS_DIR, "index.json");
+const OWNER_FILE = join(RUNS_DIR, "owner.json");
 const streams = new Map<string, WriteStream>();
 const closingStreams = new Map<string, Promise<void>>();
 const loggedErrors = new Set<string>();
+const finishedRuns = new Set<string>();
 let index: Record<string, RunSummary> | undefined;
 
 function logPersistenceError(runId: string, error: unknown): void {
@@ -34,6 +45,83 @@ function logPersistenceError(runId: string, error: unknown): void {
 
 function ensureRunsDir(): void {
   mkdirSync(RUNS_DIR, { recursive: true, mode: 0o700 });
+}
+
+interface RunOwner {
+  pid: number;
+  port: number;
+  startedAt: string;
+}
+
+function isRunOwner(owner: unknown): owner is RunOwner {
+  if (!owner || typeof owner !== "object") return false;
+  const candidate = owner as Partial<RunOwner>;
+  return Number.isInteger(candidate.pid) && (candidate.pid ?? 0) > 0
+    && Number.isInteger(candidate.port) && (candidate.port ?? -1) >= 0 && (candidate.port ?? 65536) <= 65535
+    && typeof candidate.startedAt === "string" && candidate.startedAt.length > 0;
+}
+
+function writeRunOwner(port: number): void {
+  ensureRunsDir();
+  const tmp = `${OWNER_FILE}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString(),
+    }), { encoding: "utf-8", mode: 0o600 });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, OWNER_FILE);
+  } catch (error) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // Ignore temp-file cleanup errors.
+    }
+    throw error;
+  }
+}
+
+export function claimRunOwnership(port: number): boolean {
+  try {
+    ensureRunsDir();
+    const owner = JSON.parse(readFileSync(OWNER_FILE, "utf-8")) as unknown;
+    if (isRunOwner(owner) && owner.pid !== process.pid) {
+      try {
+        process.kill(owner.pid, 0);
+        console.warn(
+          `  warning: another GitBot (pid ${owner.pid}, port ${owner.port}) is using this data directory; skipping interrupted-run recovery`,
+        );
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") {
+          console.warn(
+            `  warning: another GitBot (pid ${owner.pid}, port ${owner.port}) is using this data directory; skipping interrupted-run recovery`,
+          );
+          return false;
+        }
+      }
+    }
+  } catch {
+    // A missing, unreadable, or malformed owner file can be claimed.
+  }
+
+  try {
+    writeRunOwner(port);
+    return true;
+  } catch (error) {
+    console.error(`[run-log] unable to claim run ownership: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
+export function releaseRunOwnership(): void {
+  try {
+    const owner = JSON.parse(readFileSync(OWNER_FILE, "utf-8")) as Partial<RunOwner> | null;
+    if (owner && owner.pid === process.pid) unlinkSync(OWNER_FILE);
+  } catch {
+    // Ignore missing, malformed, or unreadable owner files during shutdown.
+  }
 }
 
 function loadIndex(): Record<string, RunSummary> {
@@ -101,7 +189,7 @@ export function startRun(store: SessionStore): string {
 
 export function appendRunEvent(store: SessionStore, event: StoredEvent): void {
   const runId = store.runId;
-  if (!runId) return;
+  if (!runId || finishedRuns.has(runId)) return;
   const stream = streamFor(runId);
   if (!stream) return;
 
@@ -116,11 +204,16 @@ export function appendRunEvent(store: SessionStore, event: StoredEvent): void {
 
 export function finishRun(runId: string, status: RunSummary["status"]): Promise<void> {
   const run = loadIndex()[runId];
+  if (finishedRuns.has(runId) || (run && run.status !== "running")) {
+    return closingStreams.get(runId) ?? Promise.resolve();
+  }
+
   if (run) {
     run.status = status;
     run.endedAt = new Date().toISOString();
     writeIndex(runId);
   }
+  finishedRuns.add(runId);
 
   const stream = streams.get(runId);
   if (!stream) return closingStreams.get(runId) ?? Promise.resolve();
@@ -139,8 +232,6 @@ export function recoverInterruptedRuns(): number {
   let recovered = 0;
   for (const run of Object.values(loadIndex())) {
     if (run.status !== "running") continue;
-    run.status = "interrupted";
-    run.endedAt = new Date().toISOString();
     appendRunEvent({ runId: run.runId } as SessionStore, {
       seq: -1,
       type: "interrupted",

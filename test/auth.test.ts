@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -15,6 +15,16 @@ test("creates a private token file and reuses it", async () => {
   assert.equal(readFileSync(tokenPath, "utf-8"), token);
   assert.equal(statSync(tokenPath).mode & 0o777, 0o600);
   assert.equal(loadOrCreateToken(), token);
+});
+
+test("repairs permissions on an existing token file", async () => {
+  const { loadOrCreateToken } = await import("../src/auth");
+  const tokenPath = join(dataDir, "token");
+  const token = loadOrCreateToken();
+  chmodSync(tokenPath, 0o644);
+
+  assert.equal(loadOrCreateToken(), token);
+  assert.equal(statSync(tokenPath).mode & 0o777, 0o600);
 });
 
 test("environment token overrides the stored token", async () => {
