@@ -1,28 +1,37 @@
-import { randomBytes, timingSafeEqual } from "crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { createHash, randomBytes, timingSafeEqual } from "crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { dataDir } from "./bot-store";
 import type { IRequest, IResponse } from "./server-common";
 
 export function loadOrCreateToken(): string {
-  if (process.env.GITBOT_TOKEN) return process.env.GITBOT_TOKEN;
+  const environmentToken = process.env.GITBOT_TOKEN?.trim();
+  if (environmentToken) return environmentToken;
 
   const directory = dataDir();
   const tokenPath = join(directory, "token");
-  if (existsSync(tokenPath)) return readFileSync(tokenPath, "utf-8").trim();
+  if (existsSync(tokenPath)) {
+    const storedToken = readFileSync(tokenPath, "utf-8").trim();
+    if (storedToken) return storedToken;
+  }
 
   mkdirSync(directory, { recursive: true });
   const token = randomBytes(32).toString("base64url");
   writeFileSync(tokenPath, token, { encoding: "utf-8", mode: 0o600 });
+  chmodSync(tokenPath, 0o600);
   return token;
 }
 
 function tokenMatches(candidate: string | undefined, token: string): boolean {
-  if (candidate === undefined) return false;
+  if (!candidate || !token) return false;
   const candidateBuffer = Buffer.from(candidate);
   const tokenBuffer = Buffer.from(token);
   if (candidateBuffer.length !== tokenBuffer.length) return false;
   return timingSafeEqual(candidateBuffer, tokenBuffer);
+}
+
+export function authCookieName(token: string): string {
+  return `gitbot_token_${createHash("sha256").update(token).digest("hex").slice(0, 12)}`;
 }
 
 export function isAuthorized(req: IRequest, token: string): boolean {
@@ -33,8 +42,9 @@ export function isAuthorized(req: IRequest, token: string): boolean {
 
   const cookieHeader = req.headers.cookie;
   const cookie = (Array.isArray(cookieHeader) ? cookieHeader[0] : cookieHeader) ?? "";
-  const cookieToken = cookie.split(";").map(part => part.trim()).find(part => part.startsWith("gitbot_token="))
-    ?.slice("gitbot_token=".length);
+  const cookieName = authCookieName(token);
+  const cookieToken = cookie.split(";").map(part => part.trim()).find(part => part.startsWith(`${cookieName}=`))
+    ?.slice(cookieName.length + 1);
   return tokenMatches(cookieToken, token);
 }
 
@@ -52,7 +62,7 @@ export function handleTokenBootstrap(req: IRequest, res: IResponse, token: strin
   url.searchParams.delete("token");
   res.writeHead(302, {
     Location: `${url.pathname}${url.search}`,
-    "Set-Cookie": `gitbot_token=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`,
+    "Set-Cookie": `${authCookieName(token)}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`,
   });
   res.end();
   return true;

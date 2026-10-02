@@ -11,12 +11,14 @@ process.env.GITBOT_DATA_DIR = dataDir;
 const token = "http-test-token";
 let server: ReturnType<typeof createServer> | undefined;
 let baseUrl: string;
+let cookieName: string;
 
 before(async () => {
-  const [{ handleRequest }, { handleTokenBootstrap }] = await Promise.all([
+  const [{ handleRequest }, { authCookieName, handleTokenBootstrap }] = await Promise.all([
     import("../src/server"),
     import("../src/auth"),
   ]);
+  cookieName = authCookieName(token);
   server = createServer((req, res) => {
     if (handleTokenBootstrap(req as any, res as any, token)) return;
     void handleRequest(req as any, res as any, [], process.cwd(), token);
@@ -47,6 +49,7 @@ test("gates API routes, bootstraps a cookie, and removes wildcard CORS", async (
   assert.equal(bootstrap.status, 302);
   assert.equal(bootstrap.headers.get("location"), "/");
   const setCookie = bootstrap.headers.get("set-cookie") ?? "";
+  assert.ok(setCookie.startsWith(`${cookieName}=${token};`));
   assert.match(setCookie, /HttpOnly/);
   assert.match(setCookie, /SameSite=Strict/);
   const cookie = setCookie.split(";")[0];
