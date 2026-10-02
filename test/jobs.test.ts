@@ -192,6 +192,36 @@ test("disables a job when its bot no longer exists", () => {
   assert.ok(logs.includes(`[jobs] disabled ${job.id}: bot ${bot.id} no longer exists`));
 });
 
+test("scheduler keeps deleted-bot jobs disabled after a due interval", () => {
+  const bot = makeBot();
+  const validation = jobStore.validateJobInput({
+    name: "Due orphaned job",
+    botId: bot.id,
+    prompt: "Run a test task",
+    trigger: { type: "interval", everyMinutes: 5 },
+    policy: { isolation: "in-place" },
+  });
+  assert.ok(validation.ok);
+  const job = jobStore.saveJob({ ...validation.job, nextRunAt: new Date(0).toISOString() });
+  assert.equal(botStore.deleteBot(bot.id), true);
+
+  const calls: Array<{ input: any; store: any }> = [];
+  const runner = jobModule.createJobRunner({
+    launch: makeLaunch(calls),
+    resolve: makeResolve(),
+    maxConcurrent: 1,
+    availableAgents: ["claude-code"],
+  });
+  const timer = jobModule.startScheduler(runner, () => new Date("2025-01-01T00:00:00.000Z"));
+  clearInterval(timer);
+
+  const saved = jobStore.getJob(job.id);
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.nextRunAt, null);
+  assert.equal(saved.lastRunStatus, "error");
+  assert.equal(calls.length, 0);
+});
+
 test("queues jobs FIFO, limits concurrency, and coalesces duplicate triggers", () => {
   const bot = makeBot();
   const calls: Array<{ input: any; store: any }> = [];

@@ -343,6 +343,8 @@ export function startScheduler(runner: JobRunner, now: () => Date = () => new Da
       }
       try {
         runner.enqueue(job, job.trigger.type);
+        const latest = getJob(job.id);
+        if (!latest || !latest.enabled) continue;
         let nextRunAt: string | null;
         try {
           nextRunAt = job.trigger.type === "interval"
@@ -352,7 +354,6 @@ export function startScheduler(runner: JobRunner, now: () => Date = () => new Da
           console.error(`[jobs] no next run time for ${job.id}: ${error instanceof Error ? error.message : String(error)}`);
           nextRunAt = null;
         }
-        const latest = getJob(job.id) ?? job;
         saveJob({ ...latest, nextRunAt, updatedAt: now().toISOString() });
       } catch (error) {
         console.error(`[jobs] scheduler failed for ${job.id}: ${error instanceof Error ? error.message : String(error)}`);
