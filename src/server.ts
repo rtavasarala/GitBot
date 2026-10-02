@@ -1,10 +1,8 @@
-import { randomUUID } from "crypto";
 import http from "node:http";
 import {
   createHttpServer,
   setupShutdown,
   handleWorkspaceRoutes,
-  createSession,
   shouldAutoApprove,
   findSession,
   emitEvent,
@@ -20,18 +18,16 @@ import {
   buildPermissionsDump,
   buildSessionsDump,
   notifyPermissionsChanged,
-  IRequest,
-  IResponse,
+  type IRequest,
+  type IResponse,
   type PermissionMode,
-  type BotPreset,
 } from "./server-common";
-import { initAgent as initClaudeCode, runAgent as runClaudeCode, listSessions as listClaudeSessions, loadTranscript } from "./start-claude-code";
-import { initAgent as initOpencode, stopAgent as stopOpencode, runAgent as runOpencode, listSessions as listOpencodeSessions, getSessionHistory, abortSession as opencodeAbort, respondPermission as opencodePermission } from "./start-opencode";
-import { initAgent as initCodex, runAgent as runCodex, listSessions as listCodexSessions, loadTranscript as loadCodexTranscript } from "./start-codex";
+import { initAgent as initClaudeCode, listSessions as listClaudeSessions, loadTranscript } from "./start-claude-code";
+import { initAgent as initOpencode, stopAgent as stopOpencode, listSessions as listOpencodeSessions, getSessionHistory, abortSession as opencodeAbort, respondPermission as opencodePermission } from "./start-opencode";
+import { initAgent as initCodex, listSessions as listCodexSessions, loadTranscript as loadCodexTranscript } from "./start-codex";
 import { handleBotRoutes } from "./bot-routes";
 import { handleMarketplaceRoutes } from "./marketplace-proxy";
-import { getBot, getThread, touchThread, updateThread, botNeedsSetup, DEFAULT_BOT_AGENT } from "./bot-store";
-import { botPermissionToSession } from "./server-common";
+import { getBot, touchThread, updateThread } from "./bot-store";
 import { uiFileFor } from "./static-ui";
 import { isAuthorized, loadOrCreateToken, handleTokenBootstrap } from "./auth";
 import {
@@ -40,8 +36,11 @@ import {
   readRun,
   recoverInterruptedRuns,
   releaseRunOwnership,
-  startRun,
 } from "./run-log";
+import { resolvePermission } from "./permissions";
+import { startTurn } from "./turns";
+import { createJobRunner, startScheduler, type JobRunner } from "./jobs";
+import { handleJobRoutes, handleJobWebhook } from "./job-routes";
 
 export async function handleRequest(
   req: IRequest,
@@ -49,6 +48,7 @@ export async function handleRequest(
   availableAgents: string[],
   workspaceCwd: string,
   token: string,
+  jobRunner?: JobRunner,
 ): Promise<void> {
   const url = req.url ?? "/";
   const method = req.method ?? "GET";
@@ -64,12 +64,15 @@ export async function handleRequest(
 
   // SPA served by createHttpServer's listener — only handle API routes here
   if (method === "GET" && (path === "/" || path === "")) return;
-  if (!isAuthorized(req, token)) {
-    jsonError(res, 401, "Unauthorized", { authRequired: true });
-    return;
-  }
-
   try {
+    if (await handleJobWebhook(req, res, jobRunner)) return;
+    if (!isAuthorized(req, token)) {
+      jsonError(res, 401, "Unauthorized", { authRequired: true });
+      return;
+    }
+
+    if (await handleJobRoutes(req, res, jobRunner)) return;
+
     // Marketplace: proxied to the gitbot-api service
     if (await handleMarketplaceRoutes(req, res)) return;
 
@@ -82,6 +85,7 @@ export async function handleRequest(
       jsonOk(res, {
         runs: listRuns({
           threadId: query.threadId,
+          jobId: query.jobId,
           status: query.status as ReturnType<typeof listRuns>[number]["status"] | undefined,
           limit: parsedLimit,
         }),
@@ -229,28 +233,7 @@ export async function handleRequest(
       if (!toolUseID) { jsonError(res, 400, "toolUseID is required"); return; }
       console.log(`[permission] id=${toolUseID} approved=${approved}`);
 
-      if (store.agent === "claude-code") {
-        const pending = store.pendingPermissions.get(toolUseID);
-        if (pending) {
-          store.pendingPermissions.delete(toolUseID);
-          notifyPermissionsChanged();
-          pending.resolve(approved
-            ? { behavior: "allow", updatedInput: updatedInput ?? pending.input }
-            : { behavior: "deny", message: "User denied" }
-          );
-        }
-      } else if (store.agent === "opencode" && store.sdkSessionId) {
-        const pending = store.pendingPermissions.get(toolUseID);
-        if (pending) {
-          store.pendingPermissions.delete(toolUseID);
-          notifyPermissionsChanged();
-          // For subagent permissions, respond on the child sdkSessionId that actually raised the request.
-          const respondSdkId = pending.askedBySdkSessionId ?? store.sdkSessionId;
-          await opencodePermission(respondSdkId, toolUseID, approved, store.repoPath).catch((err: any) => {
-            console.error("Permission response failed:", err.message);
-          });
-        }
-      }
+      await resolvePermission(store, toolUseID, approved, updatedInput);
       jsonOk(res, { ok: true });
       return;
     }
@@ -258,134 +241,12 @@ export async function handleRequest(
     // POST /chat
     if (method === "POST" && path === "/chat") {
       const body = await readBody(req);
-      let { repoPath, agent, sessionId: existingId, model, permissionMode } = body;
-      const { prompt, attachments, threadId } = body;
-      let { mode } = body;
-      // attachments: Array<{ url: string }> | undefined
-
-      // A threadId comes from the bot hub: it supplies the repo, the resume handle
-      // and the bot preset, so the client need not repeat them.
-      let botPreset: BotPreset | undefined;
-      if (threadId) {
-        const thread = getThread(threadId);
-        if (!thread) { jsonError(res, 404, "Thread not found"); return; }
-        const bot = getBot(thread.botId);
-        if (!bot) { jsonError(res, 404, "Bot not found"); return; }
-        repoPath = thread.repoPath;
-        // An explicit thread choice wins; older threads without one inherit
-        // the bot's configured agent.
-        agent = thread.agent ?? bot.agent ?? DEFAULT_BOT_AGENT;
-        if (!availableAgents.includes(agent)) {
-          jsonError(res, 400, `${bot.name} runs on ${agent}, which is not installed on this machine`, {
-            agentUnavailable: agent,
-          });
-          return;
-        }
-        if (thread.agent !== agent) updateThread(threadId, { agent });
-        existingId = thread.sdkSessionId ?? undefined;
-        model = model ?? bot.model;
-        // Bot presets speak their own vocabulary ("auto-approve", "plan"); the
-        // session speaks PermissionMode. Translate, or nothing auto-approves.
-        const botPermission = botPermissionToSession(bot.permissionMode, agent);
-        permissionMode = permissionMode ?? botPermission.permissionMode;
-        mode = mode ?? botPermission.mode;
-        const isSetup = thread.kind === "setup";
-        // Work waits on setup; the setup thread itself is exempt, since it is
-        // the thing that clears the block.
-        if (!isSetup && botNeedsSetup(bot)) {
-          jsonError(res, 409, `${bot.name} still needs to set up this machine`, {
-            setupRequired: true,
-            setupThreadId: bot.setupThreadId,
-          });
-          return;
-        }
-        botPreset = {
-          id: bot.id,
-          name: bot.name,
-          instructions: bot.instructions,
-          // The allow-list fences the bot's work. Its setup run prepares the
-          // machine, which can need tools the job itself never uses.
-          allowedTools: isSetup ? undefined : bot.allowedTools,
-          disallowedTools: bot.disallowedTools,
-          ...(isSetup ? { setup: true, setupInstructions: bot.setupInstructions } : {}),
-        };
-      }
-
-      if (!repoPath) { jsonError(res, 400, "repoPath is required"); return; }
-      if (!prompt && (!attachments || attachments.length === 0)) {
-        jsonError(res, 400, "prompt or attachments is required"); return;
-      }
-      if (attachments != null && (!Array.isArray(attachments) || attachments.some((a: any) => typeof a?.url !== "string" || !a.url))) {
-        jsonError(res, 400, "attachments must be an array of { url: string }"); return;
-      }
-      if (agent !== "claude-code" && agent !== "opencode" && agent !== "codex") {
-        jsonError(res, 400, "agent must be claude-code, opencode, or codex");
+      const result = startTurn(body, availableAgents);
+      if (!result.ok) {
+        jsonError(res, result.status, result.message, result.extra);
         return;
       }
-      if (!availableAgents.includes(agent)) {
-        jsonError(res, 400, `Agent '${agent}' is not available`);
-        return;
-      }
-
-      let store = existingId ? findSession(existingId) : undefined;
-
-      if (store) {
-        if (store.status === "running") {
-          jsonError(res, 409, "Session is already running");
-          return;
-        }
-        if (store.cleanupTimer) clearTimeout(store.cleanupTimer);
-        store.cleanupTimer = null;
-        store.status = "running";
-        notifyPermissionsChanged();
-        store.events = [];
-        store.seq = 0;
-        if (model) store.model = model;
-        if (mode) store.mode = mode;
-        if (permissionMode) store.permissionMode = permissionMode as PermissionMode;
-        if (threadId) { store.threadId = threadId; store.botPreset = botPreset; }
-        store.runId = startRun(store);
-        emitEvent(store, 'user_prompt', { prompt: prompt ?? '', ...(attachments?.length ? { attachments } : {}) });
-      } else {
-        const gitbotId = existingId ?? randomUUID();
-        store = createSession(gitbotId, agent, repoPath, model, mode, permissionMode as PermissionMode | undefined, { threadId, preset: botPreset });
-        if (existingId) {
-          store.sdkSessionId = existingId;
-        }
-        store.runId = startRun(store);
-        emitEvent(store, 'user_prompt', { prompt: prompt ?? '', ...(attachments?.length ? { attachments } : {}) });
-        notifyPermissionsChanged();
-      }
-
-      const s = store;
-      if (threadId) touchThread(threadId, prompt ?? '');
-
-      // Anything thrown past runAgent's own handling would otherwise leave the
-      // session pinned to "running": every later message on the thread answers
-      // 409 for as long as the server lives, and the event stream — which only
-      // closes on done/error/aborted — hangs the client that is watching it.
-      // Each runAgent already reports its own failures and lands on "error"
-      // before returning, so the status check makes this a no-op on every path
-      // that handled itself.
-      const onRunRejected = (err: any) => {
-        console.error("[runAgent] unhandled:", err);
-        if (s.status === "running") {
-          emitEvent(s, "error", { message: err?.message ?? `${agent} failed to start` });
-          s.status = "error";
-          scheduleCleanup(s);
-          notifyPermissionsChanged();
-        }
-      };
-
-      if (agent === "claude-code") {
-        runClaudeCode(s).catch(onRunRejected);
-      } else if (agent === "codex") {
-        runCodex(s).catch(onRunRejected);
-      } else {
-        runOpencode(s).catch(onRunRejected);
-      }
-
-      jsonOk(res, { sessionId: s.gitbotId });
+      jsonOk(res, { sessionId: result.store.gitbotId });
       return;
     }
 
@@ -532,12 +393,21 @@ export async function start(network: string = "local", portOverride?: number, ca
     if (recoveredRuns > 0) console.log(`  recovered ${recoveredRuns} interrupted run${recoveredRuns === 1 ? "" : "s"}`);
   }
 
+  const maxConcurrentJobs = Number.parseInt(process.env.GITBOT_MAX_CONCURRENT_JOBS ?? "2", 10);
+  const jobRunner = createJobRunner({
+    launch: startTurn,
+    resolve: resolvePermission,
+    maxConcurrent: Number.isInteger(maxConcurrentJobs) && maxConcurrentJobs > 0 ? maxConcurrentJobs : 2,
+    availableAgents,
+  });
+  startScheduler(jobRunner);
+
   server.on("request", (req: http.IncomingMessage, res: http.ServerResponse) => {
     if (res.headersSent || res.writableEnded) return;
     // UI files are answered by createHttpServer's listener
     if (uiFileFor(req.method, req.url)) return;
     if (handleTokenBootstrap(req as unknown as IRequest, res as unknown as IResponse, token)) return;
-    handleRequest(req as unknown as IRequest, res as unknown as IResponse, availableAgents, workspaceCwd, token);
+    handleRequest(req as unknown as IRequest, res as unknown as IResponse, availableAgents, workspaceCwd, token, jobRunner);
   });
 
   process.on("exit", stopOpencode);

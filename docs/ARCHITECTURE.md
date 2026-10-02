@@ -39,6 +39,10 @@ One Node.js process does everything. There is no database, no separate frontend 
 
 Bots and threads are stored as two JSON files under `~/.gitbot` (override with `GITBOT_DATA_DIR`). They are per machine, not per workspace. Each machine's API token is stored in `~/.gitbot/token` (or the configured data directory); `GITBOT_TOKEN` overrides the file, and deleting the file and restarting rotates it. Scripts and other machines authenticate with an `Authorization: Bearer <token>` header. Per-turn event logs and their index live under `~/.gitbot/runs/`. Full message history is still read from the agent's own transcript (`~/.claude/projects/…` for Claude Code, `~/.codex/sessions` for Codex, the local OpenCode server for OpenCode).
 
+## Background jobs
+
+Jobs are stored in `jobs.json` under the machine's data directory and can run manually, on interval/cron schedules, or from GitHub-compatible signed webhooks. The scheduler feeds an in-memory FIFO queue with a configurable concurrency limit; queued runs that have not started are lost on restart. Jobs default to human escalation and worktree isolation. Claude Code alone supports `maxTurns` and `maxBudgetUsd`; Codex has no per-tool approvals, so `deny` and approval timeouts do not apply to it.
+
 ## Transport: SSE, not WebSockets
 
 The client sends ordinary HTTP requests and receives a turn's output over a `GET /events` Server-Sent Events stream.

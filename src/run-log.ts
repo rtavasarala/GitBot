@@ -23,6 +23,10 @@ export interface RunSummary {
   repoPath: string;
   model: string | null;
   permissionMode: SessionStore["permissionMode"];
+  jobId: string | null;
+  trigger: string | null;
+  worktreePath: string | null;
+  branch: string | null;
   status: "running" | "done" | "error" | "aborted" | "interrupted";
   startedAt: string;
   endedAt: string | null;
@@ -131,6 +135,12 @@ function loadIndex(): Record<string, RunSummary> {
       ? JSON.parse(readFileSync(INDEX_FILE, "utf-8")) as Record<string, RunSummary>
       : {};
     if (!index || typeof index !== "object" || Array.isArray(index)) index = {};
+    for (const run of Object.values(index)) {
+      run.jobId ??= null;
+      run.trigger ??= null;
+      run.worktreePath ??= null;
+      run.branch ??= null;
+    }
   } catch (error) {
     logPersistenceError("index", error);
     index = {};
@@ -176,6 +186,10 @@ export function startRun(store: SessionStore): string {
     repoPath: store.repoPath,
     model: store.model ?? null,
     permissionMode: store.permissionMode,
+    jobId: store.job?.jobId ?? null,
+    trigger: store.job?.trigger ?? null,
+    worktreePath: store.job?.worktreePath ?? null,
+    branch: store.job?.branch ?? null,
     status: "running",
     startedAt: new Date().toISOString(),
     endedAt: null,
@@ -246,15 +260,25 @@ export function recoverInterruptedRuns(): number {
 
 export function listRuns(options: {
   threadId?: string;
+  jobId?: string;
   status?: RunSummary["status"];
   limit?: number;
 } = {}): RunSummary[] {
   const limit = Math.max(0, options.limit ?? 100);
   return Object.values(loadIndex())
     .filter(run => (!options.threadId || run.threadId === options.threadId)
+      && (!options.jobId || run.jobId === options.jobId)
       && (!options.status || run.status === options.status))
     .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
     .slice(0, limit);
+}
+
+export function updateRun(runId: string, patch: Partial<RunSummary>): boolean {
+  const run = loadIndex()[runId];
+  if (!run) return false;
+  Object.assign(run, patch, { runId: run.runId });
+  writeIndex(runId);
+  return true;
 }
 
 export function readRun(runId: string): { run: RunSummary; events: object[] } | undefined {

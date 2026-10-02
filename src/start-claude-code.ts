@@ -95,6 +95,8 @@ export async function runAgent(store: SessionStore): Promise<void> {
         // named on the list (mcp__server__tool) still passes.
         ...(preset?.allowedTools?.length ? { hooks: allowListHooks(preset.allowedTools, preset.name) } : {}),
         ...(preset?.disallowedTools?.length ? { disallowedTools: preset.disallowedTools } : {}),
+        ...(store.job?.policy.maxTurns !== undefined ? { maxTurns: store.job.policy.maxTurns } : {}),
+        ...(store.job?.policy.maxBudgetUsd !== undefined ? { maxBudgetUsd: store.job.policy.maxBudgetUsd } : {}),
         ...(store.sdkSessionId ? { resume: store.sdkSessionId } : {}),
         canUseTool: (toolName, input, { signal, toolUseID }) => {
           return new Promise((resolve) => {

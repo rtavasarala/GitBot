@@ -8,6 +8,7 @@ import { serveUiFile, uiAvailable, uiFileFor } from "./static-ui";
 import { listRepos, cloneRepo, createFolder, listDir, readFile, getRepoDetails, browseDirs } from "./workspace";
 import { handleTokenBootstrap } from "./auth";
 import { appendRunEvent, finishRun } from "./run-log";
+import type { JobRunMeta } from "./job-store";
 
 // --- Transport abstractions ---
 // These interfaces cover the exact surface area that route handlers use.
@@ -245,6 +246,7 @@ export interface SessionStore {
   threadId?: string;
   botPreset?: BotPreset;
   runId?: string;
+  job?: JobRunMeta;
 }
 
 /** The parts of a bot that shape the agent run. Mirrors fields on Bot in bot-store. */
