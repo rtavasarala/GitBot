@@ -52,7 +52,7 @@ gitbot start
 
 Open **http://localhost:3000** on your computer. GitBot prints a network address and QR code if you want to connect from another device on the same trusted network. The workspace works best on desktop.
 
-> **Before connecting another device:** GitBot has no authentication. Anyone who can reach its port can use the agents running on your machine. Keep it on a trusted network and never expose the port to the public internet. [Read the security notes](#security-and-privacy).
+> **Before connecting another device:** GitBot prints a sign-in link for this machine. Keep it on a trusted network and never expose the port to the public internet. [Read the security notes](#security-and-privacy).
 
 <br><br><br>
 
@@ -150,9 +150,11 @@ An **Allowed tools** list limits which tools a bot can use; its permission mode 
 
 ## Security and privacy
 
-> **Important:** GitBot has no authentication and listens on all network interfaces. Anyone who can reach its port can run agents using your machine's access. Use a trusted network, do not expose the port to the internet, and stop GitBot when you are not using it.
+> **Important:** GitBot's API requires a per-machine token. Keep the server on a trusted network, do not expose the port to the internet, and stop GitBot when you are not using it.
 
 Bots act with your user account's file and shell access. Auto-approval removes a chance to inspect individual tool calls. Imported bots may include setup instructions that run when imported, so read them and their permission mode first.
+
+The token is stored at `~/.gitbot/token` (or under `GITBOT_DATA_DIR` if set), with file permissions restricted to your user. Set `GITBOT_TOKEN` to override it. Rotate the token by deleting the token file and restarting GitBot; unset `GITBOT_TOKEN` first if you use the override. `gitbot start` prints a sign-in link that stores the token in an HttpOnly browser cookie. Scripts and other machines can authenticate with `Authorization: Bearer <token>`; run `gitbot token` to print the token.
 
 GitBot has no account, telemetry, or hosted database. Bots and thread records live under `~/.gitbot` by default. Your chosen agent sends prompts and code according to its provider configuration. GitBot also looks up your public IP at startup to print its network address.
 

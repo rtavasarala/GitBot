@@ -6,7 +6,7 @@ import {
   handleWorkspaceRoutes,
   createSession,
   shouldAutoApprove,
-  sessions,
+  findSession,
   emitEvent,
   scheduleCleanup,
   sseHeaders,
@@ -33,12 +33,15 @@ import { handleMarketplaceRoutes } from "./marketplace-proxy";
 import { getBot, getThread, touchThread, updateThread, botNeedsSetup, DEFAULT_BOT_AGENT } from "./bot-store";
 import { botPermissionToSession } from "./server-common";
 import { uiFileFor } from "./static-ui";
+import { isAuthorized, loadOrCreateToken, handleTokenBootstrap } from "./auth";
+import { listRuns, readRun, recoverInterruptedRuns, startRun } from "./run-log";
 
 export async function handleRequest(
   req: IRequest,
   res: IResponse,
   availableAgents: string[],
   workspaceCwd: string,
+  token: string,
 ): Promise<void> {
   const url = req.url ?? "/";
   const method = req.method ?? "GET";
@@ -47,17 +50,17 @@ export async function handleRequest(
 
   // CORS preflight
   if (method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Last-Event-ID, X-Client-Version, X-Daytona-Skip-Preview-Warning",
-    });
+    res.writeHead(204);
     res.end();
     return;
   }
 
   // SPA served by createHttpServer's listener — only handle API routes here
   if (method === "GET" && (path === "/" || path === "")) return;
+  if (!isAuthorized(req, token)) {
+    jsonError(res, 401, "Unauthorized", { authRequired: true });
+    return;
+  }
 
   try {
     // Marketplace: proxied to the gitbot-api service
@@ -65,6 +68,26 @@ export async function handleRequest(
 
     // Workspace + file system routes
     if (await handleWorkspaceRoutes(req, res, workspaceCwd, availableAgents)) return;
+
+    // Run logs
+    if (method === "GET" && path === "/runs") {
+      const parsedLimit = query.limit === undefined ? undefined : Number.parseInt(query.limit, 10);
+      jsonOk(res, {
+        runs: listRuns({
+          threadId: query.threadId,
+          status: query.status as ReturnType<typeof listRuns>[number]["status"] | undefined,
+          limit: parsedLimit,
+        }),
+      });
+      return;
+    }
+    const runId = parsePathParam(path, "/runs/");
+    if (method === "GET" && runId) {
+      const run = readRun(runId);
+      if (!run) { jsonError(res, 404, "Run not found"); return; }
+      jsonOk(res, run);
+      return;
+    }
 
     // Bot hub: /bots and /threads
     if (await handleBotRoutes(req, res, workspaceCwd)) return;
@@ -96,7 +119,7 @@ export async function handleRequest(
     // GET /sessions/:id/history
     const historyId = parsePathParam(path, "/sessions/")?.replace(/\/history$/, "");
     if (method === "GET" && path.endsWith("/history") && historyId) {
-      const store = sessions.get(historyId);
+      const store = findSession(historyId);
       if (!store) {
         const agentParam = query.agent as "claude-code" | "opencode" | "codex" | undefined;
         if (agentParam === "opencode") {
@@ -133,8 +156,7 @@ export async function handleRequest(
     // GET /sessions/:id/config
     const configId = parsePathParam(path, "/sessions/")?.replace(/\/config$/, "");
     if (method === "GET" && path.endsWith("/config") && configId) {
-      const store = sessions.get(configId)
-        ?? [...sessions.values()].find(s => s.sdkSessionId === configId);
+      const store = findSession(configId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
       jsonOk(res, {
         gitbotId: store.gitbotId,
@@ -150,8 +172,7 @@ export async function handleRequest(
     // GET /sessions/:id/status
     const statusId = parsePathParam(path, "/sessions/")?.replace(/\/status$/, "");
     if (method === "GET" && path.endsWith("/status") && statusId) {
-      const store = sessions.get(statusId)
-        ?? [...sessions.values()].find(s => s.sdkSessionId === statusId);
+      const store = findSession(statusId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
       jsonOk(res, { streaming: store.status === "running", sdkSessionId: store.sdkSessionId ?? null });
       return;
@@ -162,8 +183,7 @@ export async function handleRequest(
     // seen, and must not re-offer approvals that were resolved while it was away.
     const permsId = parsePathParam(path, "/sessions/")?.replace(/\/permissions$/, "");
     if (method === "GET" && path.endsWith("/permissions") && permsId) {
-      const store = sessions.get(permsId)
-        ?? [...sessions.values()].find(s => s.sdkSessionId === permsId);
+      const store = findSession(permsId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
       jsonOk(res, { pending: [...store.pendingPermissions.keys()] });
       return;
@@ -172,8 +192,7 @@ export async function handleRequest(
     // POST /sessions/:id/abort
     const abortId = parsePathParam(path, "/sessions/")?.replace(/\/abort$/, "");
     if (method === "POST" && path.endsWith("/abort") && abortId) {
-      const store = sessions.get(abortId)
-        ?? [...sessions.values()].find(s => s.sdkSessionId === abortId);
+      const store = findSession(abortId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
       if (store.status !== "running") { jsonOk(res, { ok: true }); return; }
       if (store.agent === "claude-code" && store.abortController) {
@@ -196,7 +215,7 @@ export async function handleRequest(
     // POST /sessions/:id/permission
     const permBase = parsePathParam(path, "/sessions/")?.replace(/\/permission$/, "");
     if (method === "POST" && path.endsWith("/permission") && permBase) {
-      const store = sessions.get(permBase);
+      const store = findSession(permBase);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
       const body = await readBody(req);
       const { toolUseID, approved, updatedInput } = body;
@@ -301,13 +320,15 @@ export async function handleRequest(
         return;
       }
 
-      let store = existingId ? sessions.get(existingId) : undefined;
+      let store = existingId ? findSession(existingId) : undefined;
 
       if (store) {
         if (store.status === "running") {
           jsonError(res, 409, "Session is already running");
           return;
         }
+        if (store.cleanupTimer) clearTimeout(store.cleanupTimer);
+        store.cleanupTimer = null;
         store.status = "running";
         notifyPermissionsChanged();
         store.events = [];
@@ -316,6 +337,7 @@ export async function handleRequest(
         if (mode) store.mode = mode;
         if (permissionMode) store.permissionMode = permissionMode as PermissionMode;
         if (threadId) { store.threadId = threadId; store.botPreset = botPreset; }
+        store.runId = startRun(store);
         emitEvent(store, 'user_prompt', { prompt: prompt ?? '', ...(attachments?.length ? { attachments } : {}) });
       } else {
         const gitbotId = existingId ?? randomUUID();
@@ -323,6 +345,7 @@ export async function handleRequest(
         if (existingId) {
           store.sdkSessionId = existingId;
         }
+        store.runId = startRun(store);
         emitEvent(store, 'user_prompt', { prompt: prompt ?? '', ...(attachments?.length ? { attachments } : {}) });
         notifyPermissionsChanged();
       }
@@ -363,8 +386,7 @@ export async function handleRequest(
       const sessionId = query.sessionId;
       if (!sessionId) { jsonError(res, 400, "sessionId is required"); return; }
 
-      const store = sessions.get(sessionId)
-        ?? [...sessions.values()].find(s => s.sdkSessionId === sessionId);
+      const store = findSession(sessionId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
 
       const lastSeq = parseInt(req.headers["last-event-id"] as string ?? "0", 10) || 0;
@@ -420,7 +442,7 @@ export async function handleRequest(
     // PATCH /sessions/:id — update session settings mid-run
     if (method === "PATCH" && path.startsWith("/sessions/")) {
       const sessionId = path.slice("/sessions/".length);
-      const store = sessions.get(sessionId);
+      const store = findSession(sessionId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
 
       const body = await readBody(req);
@@ -467,6 +489,9 @@ export async function handleRequest(
 }
 
 export async function start(network: string = "local", portOverride?: number, caffeinate: boolean = false) {
+  const token = loadOrCreateToken();
+  const recoveredRuns = recoverInterruptedRuns();
+  if (recoveredRuns > 0) console.log(`  recovered ${recoveredRuns} interrupted run${recoveredRuns === 1 ? "" : "s"}`);
   const workspaceCwd = process.cwd();
   console.log(`gitbot — starting workspace server in ${workspaceCwd}`);
 
@@ -493,12 +518,15 @@ export async function start(network: string = "local", portOverride?: number, ca
     caffeinate,
     network,
     label: "gitbot server",
+    token,
   });
 
   server.on("request", (req: http.IncomingMessage, res: http.ServerResponse) => {
+    if (res.headersSent || res.writableEnded) return;
     // UI files are answered by createHttpServer's listener
     if (uiFileFor(req.method, req.url)) return;
-    handleRequest(req as unknown as IRequest, res as unknown as IResponse, availableAgents, workspaceCwd);
+    if (handleTokenBootstrap(req as unknown as IRequest, res as unknown as IResponse, token)) return;
+    handleRequest(req as unknown as IRequest, res as unknown as IResponse, availableAgents, workspaceCwd, token);
   });
 
   process.on("exit", stopOpencode);

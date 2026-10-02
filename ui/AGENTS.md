@@ -17,6 +17,7 @@ and stores machine-local state in `~/.gitbot` (`bots.json`, `threads.json`).
 ## Commands
 
 - From `ui/`, `npm run dev` starts the standalone Next.js development server.
+- With `next dev`, first visit `http://localhost:3100/?token=…` using the link printed by `gitbot start`; cookies are per-host rather than per-port, so that sign-in also applies to `localhost:3000`.
 - From the repository root, `npm run dev` starts the GitBot backend and
   `npm run build` builds both the CLI and the static UI export.
 - `npm run build` uses `next build --webpack`; `npm start` serves the production build.

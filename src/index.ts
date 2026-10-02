@@ -7,6 +7,7 @@ process.on("SIGINT", () => {
 
 import { Command } from "commander";
 import { start } from "./server";
+import { loadOrCreateToken } from "./auth";
 
 const program = new Command();
 
@@ -14,6 +15,13 @@ program
   .name("gitbot")
   .description("gitbot — build and run AI bots on top of Claude Code and other coding agents")
   .version(require("../package.json").version);
+
+program
+  .command("token")
+  .description("Print this machine's GitBot access token")
+  .action(() => {
+    console.log(loadOrCreateToken());
+  });
 
 program
   .command("start")

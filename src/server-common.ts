@@ -6,6 +6,8 @@ import { EventEmitter } from "events";
 import qrcode from "qrcode-terminal";
 import { serveUiFile, uiAvailable, uiFileFor } from "./static-ui";
 import { listRepos, cloneRepo, createFolder, listDir, readFile, getRepoDetails, browseDirs } from "./workspace";
+import { handleTokenBootstrap } from "./auth";
+import { appendRunEvent, finishRun } from "./run-log";
 
 // --- Transport abstractions ---
 // These interfaces cover the exact surface area that route handlers use.
@@ -91,7 +93,7 @@ export function getTailscaleIP(): Promise<string | null> {
   });
 }
 
-export async function showQR(network: string, port: number): Promise<void> {
+export async function showQR(network: string, port: number, token: string): Promise<void> {
   let ip: string;
   let label: string;
 
@@ -119,8 +121,9 @@ export async function showQR(network: string, port: number): Promise<void> {
     label = "Custom";
   }
 
-  const url = `http://${ip}:${port}`;
+  const url = `http://${ip}:${port}/?token=${encodeURIComponent(token)}`;
   console.log(`\n  ${label}  ${url}\n`);
+  console.log(`  Local  http://localhost:${port}/?token=${encodeURIComponent(token)}`);
 
   const qrCode = await new Promise<string>((resolve) => {
     qrcode.generate(url, { small: true }, (code: string) => {
@@ -241,6 +244,7 @@ export interface SessionStore {
   // Bot hub: the thread this session belongs to, and the preset driving it.
   threadId?: string;
   botPreset?: BotPreset;
+  runId?: string;
 }
 
 /** The parts of a bot that shape the agent run. Mirrors fields on Bot in bot-store. */
@@ -257,6 +261,10 @@ export interface BotPreset {
 }
 
 export const sessions = new Map<string, SessionStore>();
+
+export function findSession(id: string): SessionStore | undefined {
+  return sessions.get(id) ?? [...sessions.values()].find(store => store.sdkSessionId === id);
+}
 
 // --- Global permissions stream ---
 
@@ -344,12 +352,17 @@ export function createSession(
   return store;
 }
 
-export function scheduleCleanup(_store: SessionStore): void {
-  // Session cleanup disabled — sessions are kept in memory indefinitely
-  // if (store.cleanupTimer) clearTimeout(store.cleanupTimer);
-  // store.cleanupTimer = setTimeout(() => {
-  //   sessions.delete(store.gitbotId);
-  // }, 60 * 60 * 1000);
+export const SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
+
+export function scheduleCleanup(store: SessionStore): void {
+  if (store.cleanupTimer) clearTimeout(store.cleanupTimer);
+  store.cleanupTimer = setTimeout(() => {
+    if (store.status !== "running" && sessions.get(store.gitbotId) === store) {
+      sessions.delete(store.gitbotId);
+      notifyPermissionsChanged();
+    }
+  }, SESSION_IDLE_TTL_MS);
+  store.cleanupTimer.unref();
 }
 
 export function emitEvent(store: SessionStore, type: string, data: Record<string, unknown>): void {
@@ -357,6 +370,12 @@ export function emitEvent(store: SessionStore, type: string, data: Record<string
   const event: StoredEvent = { seq, type, ...data };
   store.events.push(event);
   store.emitter.emit("event", event);
+  if (store.runId) {
+    appendRunEvent(store, event);
+    if (type === "done" || type === "error" || type === "aborted") {
+      void finishRun(store.runId, type === "done" ? "done" : type);
+    }
+  }
 }
 
 
@@ -367,6 +386,7 @@ export async function createHttpServer(opts: {
   caffeinate: boolean;
   network: string;
   label: string;
+  token: string;
 }): Promise<{ server: http.Server; PORT: number; caffeinatePid: number | null }> {
   const caffeinatePid = maybeCaffeinate(opts.caffeinate);
   console.log(`  workspace: ${process.cwd()}`);
@@ -390,6 +410,7 @@ export async function createHttpServer(opts: {
 
   // Serve the web UI: static files from the bundled export
   server.on("request", (req, res) => {
+    if (handleTokenBootstrap(req as unknown as IRequest, res as unknown as IResponse, opts.token)) return;
     const uiFile = uiFileFor(req.method, req.url);
     if (uiFile) {
       serveUiFile(req, res, uiFile);
@@ -416,7 +437,7 @@ export async function createHttpServer(opts: {
 
   await new Promise<void>((resolve) => {
     server.listen(PORT, async () => {
-      await showQR(opts.network, PORT);
+      await showQR(opts.network, PORT, opts.token);
       resolve();
     });
   });
@@ -450,7 +471,6 @@ export function sseHeaders(): Record<string, string> {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*",
   };
 }
 

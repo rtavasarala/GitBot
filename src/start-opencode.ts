@@ -515,6 +515,7 @@ async function startEventStream(client: any, directory: string) {
         const err = props?.error;
         const message = err?.data?.message || err?.message || err?.name || "Session error";
         emitEvent(store, "agent_error", { message });
+        emitEvent(store, "error", { message });
         store.status = "error";
         store.pendingPermissions.clear();
         notifyPermissionsChanged();

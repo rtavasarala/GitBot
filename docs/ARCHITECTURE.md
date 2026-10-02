@@ -37,7 +37,7 @@ One Node.js process does everything. There is no database, no separate frontend 
 - A **thread** is one conversation between a bot and a folder. It remembers which agent it runs on and that agent's session id.
 - A **session** is one agent conversation held in the server's memory while gitbot runs: its status, its buffered events and its pending approvals.
 
-Bots and threads are stored as two JSON files under `~/.gitbot` (override with `GITBOT_DATA_DIR`). They are per machine, not per workspace. Messages are **not** stored by gitbot: a thread's history is read back from the agent's own transcript (`~/.claude/projects/…` for Claude Code, `~/.codex/sessions` for Codex, the local OpenCode server for OpenCode).
+Bots and threads are stored as two JSON files under `~/.gitbot` (override with `GITBOT_DATA_DIR`). They are per machine, not per workspace. Each machine's API token is stored in `~/.gitbot/token` (or the configured data directory); `GITBOT_TOKEN` overrides the file, and deleting the file and restarting rotates it. Scripts and other machines authenticate with an `Authorization: Bearer <token>` header. Per-turn event logs and their index live under `~/.gitbot/runs/`. Full message history is still read from the agent's own transcript (`~/.claude/projects/…` for Claude Code, `~/.codex/sessions` for Codex, the local OpenCode server for OpenCode).
 
 ## Transport: SSE, not WebSockets
 
@@ -53,7 +53,7 @@ The client sends ordinary HTTP requests and receives a turn's output over a `GET
 - **Resumes.** A thread's next turn resumes the agent's own session: Claude Code from its `.jsonl` transcript, Codex from its session file, OpenCode from its local store.
 - **Scoped to a folder.** The agent runs with the thread's folder as its working directory.
 - **Abort.** `POST /sessions/:id/abort` signals an `AbortController` (Claude Code, Codex) or calls the SDK's abort (OpenCode).
-- **Cleanup.** Idle-session cleanup is currently disabled; finished sessions stay in memory until gitbot stops.
+- **Cleanup.** Finished sessions are evicted from memory after 30 minutes of inactivity; their durable run logs remain available.
 
 ## Agents
 
