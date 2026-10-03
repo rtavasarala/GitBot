@@ -1,12 +1,10 @@
-import { randomUUID } from "crypto";
 import http from "node:http";
 import {
   createHttpServer,
   setupShutdown,
   handleWorkspaceRoutes,
-  createSession,
   shouldAutoApprove,
-  sessions,
+  findSession,
   emitEvent,
   scheduleCleanup,
   sseHeaders,
@@ -20,25 +18,37 @@ import {
   buildPermissionsDump,
   buildSessionsDump,
   notifyPermissionsChanged,
-  IRequest,
-  IResponse,
+  type IRequest,
+  type IResponse,
   type PermissionMode,
-  type BotPreset,
 } from "./server-common";
-import { initAgent as initClaudeCode, runAgent as runClaudeCode, listSessions as listClaudeSessions, loadTranscript } from "./start-claude-code";
-import { initAgent as initOpencode, stopAgent as stopOpencode, runAgent as runOpencode, listSessions as listOpencodeSessions, getSessionHistory, abortSession as opencodeAbort, respondPermission as opencodePermission } from "./start-opencode";
-import { initAgent as initCodex, runAgent as runCodex, listSessions as listCodexSessions, loadTranscript as loadCodexTranscript } from "./start-codex";
+import { initAgent as initClaudeCode, listSessions as listClaudeSessions, loadTranscript } from "./start-claude-code";
+import { initAgent as initOpencode, stopAgent as stopOpencode, listSessions as listOpencodeSessions, getSessionHistory, abortSession as opencodeAbort, respondPermission as opencodePermission } from "./start-opencode";
+import { initAgent as initCodex, listSessions as listCodexSessions, loadTranscript as loadCodexTranscript } from "./start-codex";
 import { handleBotRoutes } from "./bot-routes";
 import { handleMarketplaceRoutes } from "./marketplace-proxy";
-import { getBot, getThread, touchThread, updateThread, botNeedsSetup, DEFAULT_BOT_AGENT } from "./bot-store";
-import { botPermissionToSession } from "./server-common";
+import { getBot, touchThread, updateThread } from "./bot-store";
 import { uiFileFor } from "./static-ui";
+import { isAuthorized, loadOrCreateToken, handleTokenBootstrap } from "./auth";
+import {
+  claimRunOwnership,
+  listRuns,
+  readRun,
+  recoverInterruptedRuns,
+  releaseRunOwnership,
+} from "./run-log";
+import { resolvePermission } from "./permissions";
+import { startTurn } from "./turns";
+import { createJobRunner, startScheduler, type JobRunner } from "./jobs";
+import { handleJobRoutes, handleJobWebhook } from "./job-routes";
 
 export async function handleRequest(
   req: IRequest,
   res: IResponse,
   availableAgents: string[],
   workspaceCwd: string,
+  token: string,
+  jobRunner?: JobRunner,
 ): Promise<void> {
   const url = req.url ?? "/";
   const method = req.method ?? "GET";
@@ -47,24 +57,48 @@ export async function handleRequest(
 
   // CORS preflight
   if (method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Last-Event-ID, X-Client-Version, X-Daytona-Skip-Preview-Warning",
-    });
+    res.writeHead(204);
     res.end();
     return;
   }
 
   // SPA served by createHttpServer's listener — only handle API routes here
   if (method === "GET" && (path === "/" || path === "")) return;
-
   try {
+    if (await handleJobWebhook(req, res, jobRunner)) return;
+    if (!isAuthorized(req, token)) {
+      jsonError(res, 401, "Unauthorized", { authRequired: true });
+      return;
+    }
+
+    if (await handleJobRoutes(req, res, jobRunner)) return;
+
     // Marketplace: proxied to the gitbot-api service
     if (await handleMarketplaceRoutes(req, res)) return;
 
     // Workspace + file system routes
     if (await handleWorkspaceRoutes(req, res, workspaceCwd, availableAgents)) return;
+
+    // Run logs
+    if (method === "GET" && path === "/runs") {
+      const parsedLimit = query.limit === undefined ? undefined : Number.parseInt(query.limit, 10);
+      jsonOk(res, {
+        runs: listRuns({
+          threadId: query.threadId,
+          jobId: query.jobId,
+          status: query.status as ReturnType<typeof listRuns>[number]["status"] | undefined,
+          limit: parsedLimit,
+        }),
+      });
+      return;
+    }
+    const runId = parsePathParam(path, "/runs/");
+    if (method === "GET" && runId) {
+      const run = readRun(runId);
+      if (!run) { jsonError(res, 404, "Run not found"); return; }
+      jsonOk(res, run);
+      return;
+    }
 
     // Bot hub: /bots and /threads
     if (await handleBotRoutes(req, res, workspaceCwd)) return;
@@ -96,7 +130,7 @@ export async function handleRequest(
     // GET /sessions/:id/history
     const historyId = parsePathParam(path, "/sessions/")?.replace(/\/history$/, "");
     if (method === "GET" && path.endsWith("/history") && historyId) {
-      const store = sessions.get(historyId);
+      const store = findSession(historyId);
       if (!store) {
         const agentParam = query.agent as "claude-code" | "opencode" | "codex" | undefined;
         if (agentParam === "opencode") {
@@ -133,8 +167,7 @@ export async function handleRequest(
     // GET /sessions/:id/config
     const configId = parsePathParam(path, "/sessions/")?.replace(/\/config$/, "");
     if (method === "GET" && path.endsWith("/config") && configId) {
-      const store = sessions.get(configId)
-        ?? [...sessions.values()].find(s => s.sdkSessionId === configId);
+      const store = findSession(configId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
       jsonOk(res, {
         gitbotId: store.gitbotId,
@@ -150,8 +183,7 @@ export async function handleRequest(
     // GET /sessions/:id/status
     const statusId = parsePathParam(path, "/sessions/")?.replace(/\/status$/, "");
     if (method === "GET" && path.endsWith("/status") && statusId) {
-      const store = sessions.get(statusId)
-        ?? [...sessions.values()].find(s => s.sdkSessionId === statusId);
+      const store = findSession(statusId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
       jsonOk(res, { streaming: store.status === "running", sdkSessionId: store.sdkSessionId ?? null });
       return;
@@ -162,8 +194,7 @@ export async function handleRequest(
     // seen, and must not re-offer approvals that were resolved while it was away.
     const permsId = parsePathParam(path, "/sessions/")?.replace(/\/permissions$/, "");
     if (method === "GET" && path.endsWith("/permissions") && permsId) {
-      const store = sessions.get(permsId)
-        ?? [...sessions.values()].find(s => s.sdkSessionId === permsId);
+      const store = findSession(permsId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
       jsonOk(res, { pending: [...store.pendingPermissions.keys()] });
       return;
@@ -172,8 +203,7 @@ export async function handleRequest(
     // POST /sessions/:id/abort
     const abortId = parsePathParam(path, "/sessions/")?.replace(/\/abort$/, "");
     if (method === "POST" && path.endsWith("/abort") && abortId) {
-      const store = sessions.get(abortId)
-        ?? [...sessions.values()].find(s => s.sdkSessionId === abortId);
+      const store = findSession(abortId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
       if (store.status !== "running") { jsonOk(res, { ok: true }); return; }
       if (store.agent === "claude-code" && store.abortController) {
@@ -196,35 +226,14 @@ export async function handleRequest(
     // POST /sessions/:id/permission
     const permBase = parsePathParam(path, "/sessions/")?.replace(/\/permission$/, "");
     if (method === "POST" && path.endsWith("/permission") && permBase) {
-      const store = sessions.get(permBase);
+      const store = findSession(permBase);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
       const body = await readBody(req);
       const { toolUseID, approved, updatedInput } = body;
       if (!toolUseID) { jsonError(res, 400, "toolUseID is required"); return; }
       console.log(`[permission] id=${toolUseID} approved=${approved}`);
 
-      if (store.agent === "claude-code") {
-        const pending = store.pendingPermissions.get(toolUseID);
-        if (pending) {
-          store.pendingPermissions.delete(toolUseID);
-          notifyPermissionsChanged();
-          pending.resolve(approved
-            ? { behavior: "allow", updatedInput: updatedInput ?? pending.input }
-            : { behavior: "deny", message: "User denied" }
-          );
-        }
-      } else if (store.agent === "opencode" && store.sdkSessionId) {
-        const pending = store.pendingPermissions.get(toolUseID);
-        if (pending) {
-          store.pendingPermissions.delete(toolUseID);
-          notifyPermissionsChanged();
-          // For subagent permissions, respond on the child sdkSessionId that actually raised the request.
-          const respondSdkId = pending.askedBySdkSessionId ?? store.sdkSessionId;
-          await opencodePermission(respondSdkId, toolUseID, approved, store.repoPath).catch((err: any) => {
-            console.error("Permission response failed:", err.message);
-          });
-        }
-      }
+      await resolvePermission(store, toolUseID, approved, updatedInput);
       jsonOk(res, { ok: true });
       return;
     }
@@ -232,129 +241,12 @@ export async function handleRequest(
     // POST /chat
     if (method === "POST" && path === "/chat") {
       const body = await readBody(req);
-      let { repoPath, agent, sessionId: existingId, model, permissionMode } = body;
-      const { prompt, attachments, threadId } = body;
-      let { mode } = body;
-      // attachments: Array<{ url: string }> | undefined
-
-      // A threadId comes from the bot hub: it supplies the repo, the resume handle
-      // and the bot preset, so the client need not repeat them.
-      let botPreset: BotPreset | undefined;
-      if (threadId) {
-        const thread = getThread(threadId);
-        if (!thread) { jsonError(res, 404, "Thread not found"); return; }
-        const bot = getBot(thread.botId);
-        if (!bot) { jsonError(res, 404, "Bot not found"); return; }
-        repoPath = thread.repoPath;
-        // An explicit thread choice wins; older threads without one inherit
-        // the bot's configured agent.
-        agent = thread.agent ?? bot.agent ?? DEFAULT_BOT_AGENT;
-        if (!availableAgents.includes(agent)) {
-          jsonError(res, 400, `${bot.name} runs on ${agent}, which is not installed on this machine`, {
-            agentUnavailable: agent,
-          });
-          return;
-        }
-        if (thread.agent !== agent) updateThread(threadId, { agent });
-        existingId = thread.sdkSessionId ?? undefined;
-        model = model ?? bot.model;
-        // Bot presets speak their own vocabulary ("auto-approve", "plan"); the
-        // session speaks PermissionMode. Translate, or nothing auto-approves.
-        const botPermission = botPermissionToSession(bot.permissionMode, agent);
-        permissionMode = permissionMode ?? botPermission.permissionMode;
-        mode = mode ?? botPermission.mode;
-        const isSetup = thread.kind === "setup";
-        // Work waits on setup; the setup thread itself is exempt, since it is
-        // the thing that clears the block.
-        if (!isSetup && botNeedsSetup(bot)) {
-          jsonError(res, 409, `${bot.name} still needs to set up this machine`, {
-            setupRequired: true,
-            setupThreadId: bot.setupThreadId,
-          });
-          return;
-        }
-        botPreset = {
-          id: bot.id,
-          name: bot.name,
-          instructions: bot.instructions,
-          // The allow-list fences the bot's work. Its setup run prepares the
-          // machine, which can need tools the job itself never uses.
-          allowedTools: isSetup ? undefined : bot.allowedTools,
-          disallowedTools: bot.disallowedTools,
-          ...(isSetup ? { setup: true, setupInstructions: bot.setupInstructions } : {}),
-        };
-      }
-
-      if (!repoPath) { jsonError(res, 400, "repoPath is required"); return; }
-      if (!prompt && (!attachments || attachments.length === 0)) {
-        jsonError(res, 400, "prompt or attachments is required"); return;
-      }
-      if (attachments != null && (!Array.isArray(attachments) || attachments.some((a: any) => typeof a?.url !== "string" || !a.url))) {
-        jsonError(res, 400, "attachments must be an array of { url: string }"); return;
-      }
-      if (agent !== "claude-code" && agent !== "opencode" && agent !== "codex") {
-        jsonError(res, 400, "agent must be claude-code, opencode, or codex");
+      const result = startTurn(body, availableAgents);
+      if (!result.ok) {
+        jsonError(res, result.status, result.message, result.extra);
         return;
       }
-      if (!availableAgents.includes(agent)) {
-        jsonError(res, 400, `Agent '${agent}' is not available`);
-        return;
-      }
-
-      let store = existingId ? sessions.get(existingId) : undefined;
-
-      if (store) {
-        if (store.status === "running") {
-          jsonError(res, 409, "Session is already running");
-          return;
-        }
-        store.status = "running";
-        notifyPermissionsChanged();
-        store.events = [];
-        store.seq = 0;
-        if (model) store.model = model;
-        if (mode) store.mode = mode;
-        if (permissionMode) store.permissionMode = permissionMode as PermissionMode;
-        if (threadId) { store.threadId = threadId; store.botPreset = botPreset; }
-        emitEvent(store, 'user_prompt', { prompt: prompt ?? '', ...(attachments?.length ? { attachments } : {}) });
-      } else {
-        const gitbotId = existingId ?? randomUUID();
-        store = createSession(gitbotId, agent, repoPath, model, mode, permissionMode as PermissionMode | undefined, { threadId, preset: botPreset });
-        if (existingId) {
-          store.sdkSessionId = existingId;
-        }
-        emitEvent(store, 'user_prompt', { prompt: prompt ?? '', ...(attachments?.length ? { attachments } : {}) });
-        notifyPermissionsChanged();
-      }
-
-      const s = store;
-      if (threadId) touchThread(threadId, prompt ?? '');
-
-      // Anything thrown past runAgent's own handling would otherwise leave the
-      // session pinned to "running": every later message on the thread answers
-      // 409 for as long as the server lives, and the event stream — which only
-      // closes on done/error/aborted — hangs the client that is watching it.
-      // Each runAgent already reports its own failures and lands on "error"
-      // before returning, so the status check makes this a no-op on every path
-      // that handled itself.
-      const onRunRejected = (err: any) => {
-        console.error("[runAgent] unhandled:", err);
-        if (s.status === "running") {
-          emitEvent(s, "error", { message: err?.message ?? `${agent} failed to start` });
-          s.status = "error";
-          notifyPermissionsChanged();
-        }
-      };
-
-      if (agent === "claude-code") {
-        runClaudeCode(s).catch(onRunRejected);
-      } else if (agent === "codex") {
-        runCodex(s).catch(onRunRejected);
-      } else {
-        runOpencode(s).catch(onRunRejected);
-      }
-
-      jsonOk(res, { sessionId: s.gitbotId });
+      jsonOk(res, { sessionId: result.store.gitbotId });
       return;
     }
 
@@ -363,8 +255,7 @@ export async function handleRequest(
       const sessionId = query.sessionId;
       if (!sessionId) { jsonError(res, 400, "sessionId is required"); return; }
 
-      const store = sessions.get(sessionId)
-        ?? [...sessions.values()].find(s => s.sdkSessionId === sessionId);
+      const store = findSession(sessionId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
 
       const lastSeq = parseInt(req.headers["last-event-id"] as string ?? "0", 10) || 0;
@@ -420,7 +311,7 @@ export async function handleRequest(
     // PATCH /sessions/:id — update session settings mid-run
     if (method === "PATCH" && path.startsWith("/sessions/")) {
       const sessionId = path.slice("/sessions/".length);
-      const store = sessions.get(sessionId);
+      const store = findSession(sessionId);
       if (!store) { jsonError(res, 404, "Session not found"); return; }
 
       const body = await readBody(req);
@@ -467,6 +358,7 @@ export async function handleRequest(
 }
 
 export async function start(network: string = "local", portOverride?: number, caffeinate: boolean = false) {
+  const token = loadOrCreateToken();
   const workspaceCwd = process.cwd();
   console.log(`gitbot — starting workspace server in ${workspaceCwd}`);
 
@@ -488,22 +380,41 @@ export async function start(network: string = "local", portOverride?: number, ca
   ];
   console.log(`  available agents: ${availableAgents.join(", ") || "none"}`);
 
-  const { server, caffeinatePid } = await createHttpServer({
+  const { server, caffeinatePid, PORT } = await createHttpServer({
     portOverride,
     caffeinate,
     network,
     label: "gitbot server",
+    token,
   });
 
+  if (claimRunOwnership(PORT)) {
+    const recoveredRuns = recoverInterruptedRuns();
+    if (recoveredRuns > 0) console.log(`  recovered ${recoveredRuns} interrupted run${recoveredRuns === 1 ? "" : "s"}`);
+  }
+
+  const maxConcurrentJobs = Number.parseInt(process.env.GITBOT_MAX_CONCURRENT_JOBS ?? "2", 10);
+  const jobRunner = createJobRunner({
+    launch: startTurn,
+    resolve: resolvePermission,
+    maxConcurrent: Number.isInteger(maxConcurrentJobs) && maxConcurrentJobs > 0 ? maxConcurrentJobs : 2,
+    availableAgents,
+  });
+  startScheduler(jobRunner);
+
   server.on("request", (req: http.IncomingMessage, res: http.ServerResponse) => {
+    if (res.headersSent || res.writableEnded) return;
     // UI files are answered by createHttpServer's listener
     if (uiFileFor(req.method, req.url)) return;
-    handleRequest(req as unknown as IRequest, res as unknown as IResponse, availableAgents, workspaceCwd);
+    if (handleTokenBootstrap(req as unknown as IRequest, res as unknown as IResponse, token)) return;
+    handleRequest(req as unknown as IRequest, res as unknown as IResponse, availableAgents, workspaceCwd, token, jobRunner);
   });
 
   process.on("exit", stopOpencode);
+  process.on("exit", releaseRunOwnership);
   setupShutdown(() => {
     stopOpencode();
+    releaseRunOwnership();
     server.close(() => process.exit(0));
   }, caffeinatePid);
 }

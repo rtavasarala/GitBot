@@ -52,6 +52,7 @@ export interface Bot {
 export interface Thread {
   id: string;
   botId: string;
+  jobId?: string;
   /** A setup thread prepares the machine; it runs before any chat thread may. */
   kind?: "chat" | "setup";
   /**
@@ -98,7 +99,7 @@ export function dataDir(): string {
 const BOTS_FILE = join(DATA_DIR, "bots.json");
 const THREADS_FILE = join(DATA_DIR, "threads.json");
 
-function readCollection<T>(file: string): T[] {
+export function readCollection<T>(file: string): T[] {
   if (!existsSync(file)) return [];
   try {
     const parsed = JSON.parse(readFileSync(file, "utf-8"));
@@ -109,7 +110,7 @@ function readCollection<T>(file: string): T[] {
   }
 }
 
-function writeCollection<T>(file: string, items: T[]): void {
+export function writeCollection<T>(file: string, items: T[]): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(items, null, 2), "utf-8");

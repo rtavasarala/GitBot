@@ -24,6 +24,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   } & Record<string, unknown>;
   if (!res.ok || body.error) {
     const { error, ...extra } = body;
+    if (res.status === 401) {
+      throw new ApiError(
+        401,
+        "Not signed in to this GitBot. Open the link printed by `gitbot start` (or run `gitbot token`).",
+        extra,
+      );
+    }
     throw new ApiError(
       res.status,
       error ?? `Request failed (${res.status})`,

@@ -1,6 +1,6 @@
 
 
-| [![GitBot](ui/public/gitbot-logo.svg)](#gitbot) | [Overview](#gitbot) · [Get running](#get-running) · [Create a bot](#create-your-first-bot) · [How it works](#how-gitbot-works) · [Share](#share-a-bot-or-submit-one-to-marketplace) · [Security](#security-and-privacy) |
+| [![GitBot](ui/public/gitbot-logo.svg)](#gitbot) | [Overview](#gitbot) · [Get running](#get-running) · [Create a bot](#create-your-first-bot) · [How it works](#how-gitbot-works) · [Share](#share-a-bot-or-submit-one-to-marketplace) · [Background jobs](#background-jobs) · [Security](#security-and-privacy) |
 | :--- | ---: |
 
 [![npm version](https://img.shields.io/npm/v/%40gitbot-hq%2Fgitbot?style=flat-square&label=npm)](https://www.npmjs.com/package/@gitbot-hq/gitbot)
@@ -50,9 +50,9 @@ cd /path/to/your/projects
 gitbot start
 ```
 
-Open **http://localhost:3000** on your computer. GitBot prints a network address and QR code if you want to connect from another device on the same trusted network. The workspace works best on desktop.
+Open the localhost URL at the port printed by `gitbot start` (default range **32100–32199**). GitBot prints a network address and QR code if you want to connect from another device on the same trusted network. The workspace works best on desktop.
 
-> **Before connecting another device:** GitBot has no authentication. Anyone who can reach its port can use the agents running on your machine. Keep it on a trusted network and never expose the port to the public internet. [Read the security notes](#security-and-privacy).
+> **Before connecting another device:** GitBot prints a sign-in link for this machine. Keep it on a trusted network and never expose the port to the public internet. [Read the security notes](#security-and-privacy).
 
 <br><br><br>
 
@@ -148,11 +148,61 @@ An **Allowed tools** list limits which tools a bot can use; its permission mode 
 
 <br><br><br>
 
+## Background jobs
+
+Create scheduled, manual, or webhook-triggered runs through the authenticated API. Jobs default to **escalate**: Claude Code and OpenCode wait for a human when a tool needs approval. Worktree isolation is the default; `auto` approvals require it.
+
+Create a weekday cron job:
+
+```bash
+# Replace with the port printed by `gitbot start` (default range: 32100–32199).
+PORT=32100
+API="http://localhost:$PORT"
+TOKEN="$(gitbot token)"
+curl -sS "$API/jobs" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Weekday maintenance",
+    "botId": "<bot-id>",
+    "repoPath": "/path/to/repo",
+    "prompt": "Review the repository and handle routine maintenance.",
+    "trigger": { "type": "cron", "expr": "0 9 * * 1-5" },
+    "policy": { "approvals": "escalate", "isolation": "worktree" }
+  }'
+```
+
+Run a job immediately:
+
+```bash
+curl -sS -X POST "$API/jobs/<job-id>/run" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+For a webhook job, save its `webhookSecret` from the authenticated job response. Sign the exact raw JSON body with GitHub's `X-Hub-Signature-256` format:
+
+```bash
+JOB_ID="replace-with-job-id"
+WEBHOOK_SECRET="replace-with-webhook-secret"
+PAYLOAD='{"action":"opened"}'
+SIGNATURE="sha256=$(printf '%s' "$PAYLOAD" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $NF}')"
+curl -sS -X POST "$API/hooks/jobs/$JOB_ID" \
+  -H "X-GitHub-Event: issues" \
+  -H "X-Hub-Signature-256: $SIGNATURE" \
+  --data-binary "$PAYLOAD"
+```
+
+The job records are durable, but the FIFO run queue is in memory: queued jobs that have not started are lost if GitBot restarts. `maxTurns` and `maxBudgetUsd` apply only to Claude Code. Codex has no per-tool approval channel, so job `deny` and approval-timeout policies do not apply to Codex runs.
+
+<br><br><br>
+
 ## Security and privacy
 
-> **Important:** GitBot has no authentication and listens on all network interfaces. Anyone who can reach its port can run agents using your machine's access. Use a trusted network, do not expose the port to the internet, and stop GitBot when you are not using it.
+> **Important:** GitBot's API requires a per-machine token. Keep the server on a trusted network, do not expose the port to the internet, and stop GitBot when you are not using it.
 
 Bots act with your user account's file and shell access. Auto-approval removes a chance to inspect individual tool calls. Imported bots may include setup instructions that run when imported, so read them and their permission mode first.
+
+The token is stored at `~/.gitbot/token` (or under `GITBOT_DATA_DIR` if set), with file permissions restricted to your user. Set `GITBOT_TOKEN` to override it. Rotate the token by deleting the token file and restarting GitBot; unset `GITBOT_TOKEN` first if you use the override. `gitbot start` prints a sign-in link that stores the token in an HttpOnly browser cookie. Scripts and other machines can authenticate with `Authorization: Bearer <token>`; run `gitbot token` to print the token.
 
 GitBot has no account, telemetry, or hosted database. Bots and thread records live under `~/.gitbot` by default. Your chosen agent sends prompts and code according to its provider configuration. GitBot also looks up your public IP at startup to print its network address.
 
@@ -161,7 +211,7 @@ GitBot has no account, telemetry, or hosted database. Bots and thread records li
 ## Useful commands
 
 ```bash
-gitbot start                 # use port 3000
+gitbot start                 # auto-select a port from 32100–32199
 gitbot start -p 4000         # choose another port
 gitbot start --caffeinate    # keep a Mac awake during long jobs
 ```
@@ -175,7 +225,7 @@ The folder where you run `gitbot start` becomes the workspace shown first in the
 | If you see... | Try this |
 | --- | --- |
 | An agent is missing from the menu | Install and sign in to its CLI, then restart GitBot. |
-| Port 3000 is already in use | Run `gitbot start -p 4000`. |
+| No port is available in the default range | Run `gitbot start -p 4000`. |
 | An imported bot needs an agent you don't have | Install that agent or change the bot's agent. |
 | The web UI has not been built | If running from source, run `npm run build`. |
 
